@@ -1,16 +1,18 @@
 import sys
 from pathlib import Path
 from datetime import datetime
+import time as _time
 
 import serial
 from serial.tools import list_ports
 
-from PySide6.QtCore import QFile, QObject
+from PySide6.QtCore import QFile, QObject, QThread, Signal
 from PySide6.QtWidgets import QApplication
 from PySide6.QtUiTools import QUiLoader
 
 
 BAUDRATE = 460_800
+FRAME_DELIM = b"\r"
 
 
 def ts() -> str:
@@ -29,26 +31,63 @@ def load_ui(ui_path: Path):
 
     if window is None:
         raise RuntimeError("QUiLoader no pudo cargar la UI (window=None).")
-
     return window
 
 
-def find_child(window: QObject, name: str, type_hint=None):
+def find_child(window: QObject, name: str):
     obj = window.findChild(QObject, name)
     if obj is None:
         raise RuntimeError(f"No encontré el widget '{name}' en el .ui (revisá objectName).")
-    if type_hint is not None and not isinstance(obj, type_hint):
-        # No forzamos import de clases QtWidgets acá; solo avisamos
-        pass
     return obj
+
+
+class SerialReader(QThread):
+    frame_received = Signal(bytes)
+    info = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, ser: serial.Serial):
+        super().__init__()
+        self.ser = ser
+        self._stop = False
+        self._buf = bytearray()
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        self.info.emit("RX thread iniciado.")
+        try:
+            while not self._stop:
+                try:
+                    data = self.ser.read(4096)  # timeout=0 => no bloquea
+                except Exception as e:
+                    self.error.emit(f"ERROR leyendo serial: {e}")
+                    break
+
+                if data:
+                    self._buf.extend(data)
+                    while True:
+                        idx = self._buf.find(FRAME_DELIM)
+                        if idx < 0:
+                            break
+                        frame = bytes(self._buf[:idx])  # sin el \r
+                        del self._buf[:idx + 1]
+                        self.frame_received.emit(frame)
+                else:
+                    # dormir un poquito para no quemar CPU
+                    self.msleep(2)
+        finally:
+            self.info.emit("RX thread detenido.")
 
 
 class AppController:
     def __init__(self, window):
         self.window = window
         self.serial_port: serial.Serial | None = None
+        self.reader: SerialReader | None = None
 
-        # Widgets por objectName
+        # Widgets
         self.port_combo = find_child(window, "portCombo")
         self.refresh_btn = find_child(window, "refreshPortsButton")
         self.connect_btn = find_child(window, "connectButton")
@@ -59,16 +98,14 @@ class AppController:
         # Estado inicial
         self.disconnect_btn.setEnabled(False)
 
-        # Conexiones de señales
+        # Signals
         self.refresh_btn.clicked.connect(self.refresh_ports)
         self.connect_btn.clicked.connect(self.connect_serial)
         self.disconnect_btn.clicked.connect(self.disconnect_serial)
 
-        # Primera carga de puertos
         self.refresh_ports()
 
     def log(self, msg: str):
-        # QPlainTextEdit
         self.console.appendPlainText(f"[{ts()}] {msg}")
 
     def refresh_ports(self):
@@ -88,19 +125,57 @@ class AppController:
         self.connect_btn.setEnabled(self.serial_port is None)
 
         for p in ports:
-            # p.device: "/dev/ttyUSB0" o "COM3"
-            # p.description: texto descriptivo
-            # p.hwid: id hw
             label = f"{p.device} — {p.description}"
             self.port_combo.addItem(label, p.device)
 
-        # Intentar restaurar selección previa
         if current_data:
             idx = self.port_combo.findData(current_data)
             if idx >= 0:
                 self.port_combo.setCurrentIndex(idx)
 
         self.log(f"Puertos detectados: {len(ports)}")
+
+    def start_reader(self):
+        if self.serial_port is None:
+            return
+        if self.reader is not None:
+            return
+
+        self.reader = SerialReader(self.serial_port)
+        self.reader.info.connect(self.log)
+        self.reader.error.connect(self.log)
+        self.reader.frame_received.connect(self.on_frame_received)
+        self.reader.start()
+
+    def stop_reader(self):
+        if self.reader is None:
+            return
+        self.reader.stop()
+        self.reader.wait(1000)
+        self.reader = None
+
+    def on_frame_received(self, frame: bytes):
+        # Por ahora asumimos ASCII/texto para estos comandos.
+        # (Más adelante, para binario, esto se trata distinto.)
+        try:
+            text = frame.decode("ascii", errors="replace")
+        except Exception:
+            text = str(frame)
+        self.log(f"RX: {text}")
+
+    def send_line(self, line: str):
+        if self.serial_port is None:
+            self.log("TX falló: no conectado.")
+            return
+
+        payload = (line + "\r").encode("ascii", errors="strict")
+        try:
+            self.serial_port.write(payload)
+        except Exception as e:
+            self.log(f"ERROR TX: {e}")
+            return
+
+        self.log(f"TX: {line}")
 
     def connect_serial(self):
         if self.serial_port is not None:
@@ -116,7 +191,7 @@ class AppController:
             self.serial_port = serial.Serial(
                 port=port,
                 baudrate=BAUDRATE,
-                timeout=0,           # no bloqueante (por ahora)
+                timeout=0,
                 write_timeout=0,
             )
         except Exception as e:
@@ -132,12 +207,26 @@ class AppController:
         self.port_combo.setEnabled(False)
         self.refresh_btn.setEnabled(False)
 
+        # Arrancar RX
+        self.start_reader()
+
+        # Handshake: set time y pedir time
+        now = datetime.now()  # hora local del PC
+        hhmmss = now.strftime("%H:%M:%S")
+        self.send_line(f"time={hhmmss}")
+        # pequeñísimo delay para no pegar comandos en el mismo burst si el AVR es sensible
+        _time.sleep(0.02)
+        self.send_line("time")
+
     def disconnect_serial(self):
         if self.serial_port is None:
             self.log("No estoy conectado.")
             return
 
         port = self.serial_port.port
+
+        self.stop_reader()
+
         try:
             self.serial_port.close()
         except Exception as e:
@@ -154,25 +243,18 @@ class AppController:
         self.refresh_btn.setEnabled(True)
 
     def shutdown(self):
-        # Para cerrar limpio al salir
         if self.serial_port is not None:
             self.disconnect_serial()
 
 
 def main():
     app = QApplication(sys.argv)
-
     ui_path = Path(__file__).resolve().parent / "main_window.ui"
     window = load_ui(ui_path)
     window.setWindowTitle("RFQ_test")
 
     controller = AppController(window)
-
-    # Cierre limpio
-    def on_about_to_quit():
-        controller.shutdown()
-
-    app.aboutToQuit.connect(on_about_to_quit)
+    app.aboutToQuit.connect(controller.shutdown)
 
     window.show()
     sys.exit(app.exec())
