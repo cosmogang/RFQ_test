@@ -56,6 +56,13 @@
         </widget>
        </item>
        <item>
+        <widget class="QCheckBox" name="viEnableCheck">
+         <property name="text">
+          <string>Isolated DC/DC Enable</string>
+         </property>
+        </widget>
+       </item>
+       <item>
         <widget class="QCheckBox" name="logCheck">
          <property name="text">
           <string>Log</string>

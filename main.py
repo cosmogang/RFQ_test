@@ -95,6 +95,12 @@ class AppController:
         self.log_check = find_child(window, "logCheck")
         self.console = find_child(window, "consoleText")
 
+        #Buscá en __init__ de AppController y agregá esto después de cargar widgets:
+        self.vi_check = find_child(window, "viEnableCheck")
+        self._updating_vi_from_rx = False
+        self.vi_check.setEnabled(False)  # solo habilitado cuando hay conexión
+        self.vi_check.toggled.connect(self.on_vi_toggled)
+
         # Estado inicial
         self.disconnect_btn.setEnabled(False)
 
@@ -159,6 +165,17 @@ class AppController:
         # (Más adelante, para binario, esto se trata distinto.)
         try:
             text = frame.decode("ascii", errors="replace")
+            #Ahora, en on_frame_received, después de text = ..., agregá un parse simple
+            # Parse simple de respuestas tipo: "vi 0" o "vi 1" (o "vi=0"/"vi=1" si alguna vez lo mandás así)
+            t = text.strip()
+
+            if t.startswith("vi"):
+                # soporta "vi 1", "vi=1", "vi 0", etc.
+                parts = t.replace("=", " ").split()
+                if len(parts) >= 2 and parts[0] == "vi":
+                    if parts[1] in ("0", "1"):
+                        self.apply_vi_state_from_rx(int(parts[1]))
+            
         except Exception:
             text = str(frame)
         self.log(f"RX: {text}")
@@ -215,12 +232,36 @@ class AppController:
         hhmmss = now.strftime("%H:%M:%S")
         self.send_line(f"time={hhmmss}")
         # pequeñísimo delay para no pegar comandos en el mismo burst si el AVR es sensible
-        _time.sleep(0.02)
+        _time.sleep(1.02) # Aumente el delay a 1.02 segundos para mayor fiabilidad
         self.send_line("time")
+
+        #En connect_serial(), después del handshake time agregá:
+        _time.sleep(0.02)
+        self.request_vi_state()
+        self.vi_check.setEnabled(True)
+
+        #Agregá estos métodos dentro de AppController:
+    def on_vi_toggled(self, checked: bool):
+        if self._updating_vi_from_rx:
+            return
+        self.send_line(f"vi={1 if checked else 0}")
+
+    def request_vi_state(self):
+        self.send_line("vi")
+
+    def apply_vi_state_from_rx(self, value: int):
+        self._updating_vi_from_rx = True
+        try:
+            self.vi_check.setChecked(bool(value))
+        finally:
+            self._updating_vi_from_rx = False
+        
 
     def disconnect_serial(self):
         if self.serial_port is None:
             self.log("No estoy conectado.")
+        #En disconnect_serial(), antes de salir, agregá:
+            self.vi_check.setEnabled(False)
             return
 
         port = self.serial_port.port
