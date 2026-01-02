@@ -101,6 +101,22 @@ class AppController:
         self.vi_check.setEnabled(False)  # solo habilitado cuando hay conexión
         self.vi_check.toggled.connect(self.on_vi_toggled)
 
+        # DAC widgets (AVR internal DAC: 0–5V, counts 0..1023)
+        self.dac_group = find_child(window, "dacGroup")
+        self.dac_volts = find_child(window, "dacVoltsSpin")
+        self.dac_counts_label = find_child(window, "dacCountsLabel")
+        self.send_dac_btn = find_child(window, "sendDacButton")
+
+        # deshabilitado hasta conectar
+        self.dac_group.setEnabled(False)
+
+        # señales
+        self.dac_volts.valueChanged.connect(self.update_dac_preview)
+        self.send_dac_btn.clicked.connect(self.send_dac)
+
+        # inicializar preview
+        self.update_dac_preview()
+
         # Estado inicial
         self.disconnect_btn.setEnabled(False)
 
@@ -181,6 +197,7 @@ class AppController:
         self.log(f"RX: {text}")
 
     def send_line(self, line: str):
+        line = line.strip().lower()
         if self.serial_port is None:
             self.log("TX falló: no conectado.")
             return
@@ -239,6 +256,7 @@ class AppController:
         _time.sleep(0.02)
         self.request_vi_state()
         self.vi_check.setEnabled(True)
+        self.dac_group.setEnabled(True)
 
         #Agregá estos métodos dentro de AppController:
     def on_vi_toggled(self, checked: bool):
@@ -262,6 +280,7 @@ class AppController:
             self.log("No estoy conectado.")
         #En disconnect_serial(), antes de salir, agregá:
             self.vi_check.setEnabled(False)
+            self.dac_group.setEnabled(False)
             return
 
         port = self.serial_port.port
@@ -282,6 +301,29 @@ class AppController:
         self.disconnect_btn.setEnabled(False)
         self.port_combo.setEnabled(True)
         self.refresh_btn.setEnabled(True)
+
+    DAC_MAX_COUNTS = 1023
+    DAC_VREF = 5.0
+
+    def volts_to_counts(self, volts: float) -> int:
+        if volts < 0.0:
+            volts = 0.0
+        if volts > self.DAC_VREF:
+            volts = self.DAC_VREF
+        counts = int(round((volts / self.DAC_VREF) * self.DAC_MAX_COUNTS))
+        if counts < 0:
+            counts = 0
+        if counts > self.DAC_MAX_COUNTS:
+            counts = self.DAC_MAX_COUNTS
+        return counts
+
+    def update_dac_preview(self):
+        counts = self.volts_to_counts(float(self.dac_volts.value()))
+        self.dac_counts_label.setText(f"Counts: {counts}")
+
+    def send_dac(self):
+        counts = self.volts_to_counts(float(self.dac_volts.value()))
+        self.send_line(f"dac={counts}")
 
     def shutdown(self):
         if self.serial_port is not None:
